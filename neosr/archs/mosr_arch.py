@@ -3,7 +3,7 @@ from functools import partial
 import torch
 import torch.nn.functional as F
 from torch import nn
-
+from torch.nn.init import trunc_normal_
 from neosr.archs.arch_util import DropPath, DySample, net_opt
 from neosr.utils.registry import ARCH_REGISTRY
 
@@ -84,7 +84,7 @@ class Dynamic_conv2d(nn.Module):
     def forward(self, x):  # 将batch视作维度变量，进行组卷积，因为组卷积的权重是不同的，动态卷积的权重也是不同的
         softmax_attention = self.attention(x)
         batch_size, in_planes, height, width = x.size()
-        x = x.view(1, -1, height, width)  # 变化成一个维度进行组卷积
+        x = x.reshape(1, -1, height, width)  # 变化成一个维度进行组卷积
         weight = self.weight.view(self.K, -1)
 
         # 动态卷积的权重的生成， 生成的是batch_size个卷积参数（每个参数不同）
@@ -141,37 +141,60 @@ class GatedCNNBlock(nn.Module):
         return x + shortcut
 
 
+class GatedBlocks(nn.Module):
+    def __init__(self,
+                 in_dim,
+                 out_dim,
+                 n_blocks,
+                 drop_path
+                 ):
+        super().__init__()
+        self.in_to_out = Dynamic_conv2d(in_dim, out_dim, 3, padding=1)
+        self.gcnn = nn.Sequential(
+            *[GatedCNNBlock(out_dim, drop_path=drop_path)
+              for _ in range(n_blocks)
+              ])
+
+    def forward(self, x):
+        x = self.in_to_out(x)
+        x = x.permute(0, 2, 3, 1)
+        x = self.gcnn(x)
+        return x.permute(0, 3, 1, 2)
+
+
 @ARCH_REGISTRY.register()
 class mosr(nn.Module):
     def __init__(self,
                  in_ch: int = 3,
                  out_ch: int = 3,
-                 dim: int = 32,
                  upscale: int = upscale,
-                 n_block: int = 10,
-                 upsampler: str = "dys",
+                 blocks: tuple[int] = (3, 3, 9, 3),
+                 dims: tuple[int] = (48, 96, 192, 288),
+                 upsampler: str = "ps",
                  drop_path: float = 0.
                  ):
         super(mosr, self).__init__()
-        self.start_conv = Dynamic_conv2d(in_ch, dim, 3, padding=1)
-        self.gcnnb = nn.Sequential(*[GatedCNNBlock(dim, drop_path=drop_path)
-                                   for _ in range(n_block)]
-                                 )
+        len_blocks = len(blocks)
+        dims = [in_ch] + list(dims)
+        self.gblocks = nn.Sequential(*[GatedBlocks(dims[i], dims[i + 1], blocks[i], drop_path=drop_path)
+                                       for i in range(len_blocks)]
+                                     )
+
         if upsampler == "ps":
             self.upsampler = nn.Sequential(
-                nn.Conv2d(dim,
+                nn.Conv2d(dims[-1],
                           out_ch * (upscale ** 2),
                           3, padding=1),
                 nn.PixelShuffle(upscale)
             )
         elif upsampler == "dys":
-            self.upsampler = DySample(dim, out_ch, upscale)
+            self.upsampler = DySample(dims[-1], out_ch, upscale)
         elif upsampler == "conv":
             if upsampler != 1:
                 msg = "conv supports only 1x"
                 raise ValueError(msg)
 
-            self.upsampler = nn.Conv2d(dim,
+            self.upsampler = nn.Conv2d(dims[-1],
                                        out_ch,
                                        3, padding=1)
         else:
@@ -179,9 +202,14 @@ class mosr(nn.Module):
                 f'upsampler: {upsampler} not supported, choose one of these options: \
                 ["ps", "dys", "conv"] conv supports only 1x')
 
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, (nn.Conv2d, nn.Linear)):
+            trunc_normal_(m.weight, std=.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+
     def forward(self, x):
-        x = self.start_conv(x)
-        x = x.permute(0, 2, 3, 1)
-        x = self.gcnnb(x)
-        x = x.permute(0, 3, 1, 2)
+        x = self.gblocks(x)
         return self.upsampler(x)
