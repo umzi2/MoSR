@@ -1,5 +1,3 @@
-from functools import partial
-
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -20,7 +18,6 @@ class attention2d(nn.Module):
         else:
             hidden_planes = K
         self.fc1 = nn.Conv2d(in_planes, hidden_planes, 1, bias=False)
-        # self.bn = nn.BatchNorm2d(hidden_planes)
         self.fc2 = nn.Conv2d(hidden_planes, K, 1, bias=True)
         self.temperature = temperature
         if init_weight:
@@ -81,13 +78,12 @@ class Dynamic_conv2d(nn.Module):
     def update_temperature(self):
         self.attention.updata_temperature()
 
-    def forward(self, x):  # 将batch视作维度变量，进行组卷积，因为组卷积的权重是不同的，动态卷积的权重也是不同的
+    def forward(self, x):
         softmax_attention = self.attention(x)
         batch_size, in_planes, height, width = x.size()
-        x = x.reshape(1, -1, height, width)  # 变化成一个维度进行组卷积
+        x = x.reshape(1, -1, height, width)
         weight = self.weight.view(self.K, -1)
 
-        # 动态卷积的权重的生成， 生成的是batch_size个卷积参数（每个参数不同）
         aggregate_weight = torch.mm(softmax_attention, weight).view(batch_size * self.out_planes,
                                                                     self.in_planes // self.groups, self.kernel_size,
                                                                     self.kernel_size)
@@ -112,16 +108,16 @@ class GatedCNNBlock(nn.Module):
             also used by InceptionNeXt (https://arxiv.org/abs/2303.16900) and FasterNet (https://arxiv.org/abs/2303.03667)
     """
 
-    def __init__(self, dim, expansion_ratio=8 / 3, kernel_size=7, conv_ratio=1.0,
-                 norm_layer=partial(nn.LayerNorm, eps=1e-6),
-                 act_layer=nn.Mish,
-                 drop_path=0.,
-                 **kwargs):
+    def __init__(self, dim,
+                 expansion_ratio=8 / 3,
+                 kernel_size=7,
+                 conv_ratio=1.0,
+                 drop_path=0.):
         super().__init__()
-        self.norm = norm_layer(dim)
+        self.norm = nn.LayerNorm(dim, eps=1e-6)
         hidden = int(expansion_ratio * dim)
         self.fc1 = nn.Linear(dim, hidden * 2)
-        self.act = act_layer()
+        self.act = nn.Mish()
         conv_channels = int(conv_ratio * dim)
         self.split_indices = [hidden, hidden - conv_channels, conv_channels]
         self.conv = nn.Conv2d(conv_channels, conv_channels, kernel_size=kernel_size, padding=kernel_size // 2,
@@ -146,12 +142,14 @@ class GatedBlocks(nn.Module):
                  in_dim,
                  out_dim,
                  n_blocks,
-                 drop_path
+                 drop_path,
+                 expansion_ratio
                  ):
         super().__init__()
         self.in_to_out = Dynamic_conv2d(in_dim, out_dim, 3, padding=1)
+
         self.gcnn = nn.Sequential(
-            *[GatedCNNBlock(out_dim, drop_path=drop_path)
+            *[GatedCNNBlock(out_dim, expansion_ratio=expansion_ratio, drop_path=drop_path)
               for _ in range(n_blocks)
               ])
 
@@ -167,18 +165,20 @@ class mosr(nn.Module):
     def __init__(self,
                  in_ch: int = 3,
                  out_ch: int = 3,
-                 upscale: int = upscale,
+                 upscale: int = 4,
                  blocks: tuple[int] = (3, 3, 9, 3),
                  dims: tuple[int] = (48, 96, 192, 288),
                  upsampler: str = "ps",
-                 drop_path: float = 0.
+                 drop_path: float = 0.,
+                 expansion_ratio: float = 1.0
                  ):
         super(mosr, self).__init__()
         len_blocks = len(blocks)
         dims = [in_ch] + list(dims)
-        self.gblocks = nn.Sequential(*[GatedBlocks(dims[i], dims[i + 1], blocks[i], drop_path=drop_path)
-                                       for i in range(len_blocks)]
-                                     )
+        self.gblocks = nn.Sequential(
+            *[GatedBlocks(dims[i], dims[i + 1], blocks[i], drop_path=drop_path, expansion_ratio=expansion_ratio)
+              for i in range(len_blocks)]
+        )
 
         if upsampler == "ps":
             self.upsampler = nn.Sequential(
@@ -201,7 +201,6 @@ class mosr(nn.Module):
             raise NotImplementedError(
                 f'upsampler: {upsampler} not supported, choose one of these options: \
                 ["ps", "dys", "conv"] conv supports only 1x')
-
         self.apply(self._init_weights)
 
     def _init_weights(self, m):
