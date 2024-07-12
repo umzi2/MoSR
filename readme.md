@@ -54,7 +54,6 @@ def detect(state):
 Training code from [NeoSR](https://github.com/muslll/neosr)
 
 [MambaOut](https://github.com/yuweihao/MambaOut)
-
-[DyConv](https://github.com/kaijieshi7/Dynamic-convolution-Pytorch)
+[DCCM](https://github.com/dslisleedh/PLKSR/blob/main/plksr/archs/plksr_arch.py#L44)
 ### TODO:
 - release metrics and pretrain
