@@ -8,6 +8,8 @@ def pixelshuffle_scale(ps_size: int, channels: int):
 
 def dysample_scale(ds_size: int):
     return math.isqrt(ds_size // 8)
+
+
 def get_seq_len(state_dict: Mapping[str, object], seq_key: str) -> int:
     """
     Returns the length of a sequence in the state dict.
@@ -29,6 +31,8 @@ def get_seq_len(state_dict: Mapping[str, object], seq_key: str) -> int:
     if len(keys) == 0:
         return 0
     return max(keys) + 1
+
+
 def detect(state):
         len_blocks = get_seq_len(state, 'gblocks')
         blocks = [get_seq_len(state, f'gblocks.{index}.gcnn') for index in range(len_blocks)]
@@ -54,6 +58,9 @@ def detect(state):
 Training code from [NeoSR](https://github.com/muslll/neosr)
 
 [MambaOut](https://github.com/yuweihao/MambaOut)
+
 [DCCM](https://github.com/dslisleedh/PLKSR/blob/main/plksr/archs/plksr_arch.py#L44)
+
+[get_seq_len](https://github.com/chaiNNer-org/spandrel/blob/main/libs/spandrel/spandrel/util/__init__.py#L60)
 ### TODO:
 - release metrics and pretrain
