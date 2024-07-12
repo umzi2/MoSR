@@ -1,11 +1,23 @@
 import torch
-import torch.nn.functional as F
 from torch import nn
 from torch.nn.init import trunc_normal_
-from neosr.archs.arch_util import DropPath, DySample, net_opt
+from neosr.archs.arch_util import DropPath, DySample
 from neosr.utils.registry import ARCH_REGISTRY
 
+
 upscale, __ = net_opt()
+
+
+class DCCM(nn.Sequential):
+    "Doubled Convolutional Channel Mixer"
+
+    def __init__(self, in_ch: int, out_ch):
+        super().__init__(
+            nn.Conv2d(in_ch, out_ch * 2, 3, 1, 1),
+            nn.Mish(),
+            nn.Conv2d(out_ch * 2, out_ch, 3, 1, 1),
+        )
+        trunc_normal_(self[-1].weight, std=0.02)
 
 
 class GatedCNNBlock(nn.Module):
@@ -33,6 +45,13 @@ class GatedCNNBlock(nn.Module):
                               groups=conv_channels)
         self.fc2 = nn.Linear(hidden, dim)
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, (nn.Conv2d, nn.Linear)):
+            trunc_normal_(m.weight, std=.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
 
     def forward(self, x):
         shortcut = x  # [B, H, W, C]
@@ -55,19 +74,21 @@ class GatedBlocks(nn.Module):
                  expansion_ratio
                  ):
         super().__init__()
-        self.in_to_out = nn.Conv2d(in_dim, out_dim, kernel_size=3, padding=1)
+        self.in_to_out = nn.Conv2d(in_dim, out_dim, 3, 1, 1)
+        self.dcm_mix = DCCM(out_dim, out_dim)
         self.gcnn = nn.Sequential(
             *[GatedCNNBlock(out_dim,
                             expansion_ratio=expansion_ratio,
-                            drop_path=drop_path)
-              for _ in range(n_blocks)
+                            drop_path=drop_path[i])
+              for i in range(n_blocks)
               ])
 
     def forward(self, x):
         x = self.in_to_out(x)
-        x = x.permute(0, 2, 3, 1)
-        x = self.gcnn(x)
-        return x.permute(0, 3, 1, 2)
+        short_cut = x
+        x = self.gcnn(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        x = self.dcm_mix(x)
+        return x + short_cut
 
 
 @ARCH_REGISTRY.register()
@@ -76,17 +97,18 @@ class mosr(nn.Module):
                  in_ch: int = 3,
                  out_ch: int = 3,
                  upscale: int = upscale,
-                 blocks: tuple[int] = (3, 3, 9, 3),
-                 dims: tuple[int] = (48, 96, 192, 288),
+                 blocks: list[int] = [3, 3, 15, 3],
+                 dims: list[int] = [64, 96, 192, 288],
                  upsampler: str = "ps",
-                 drop_path: float = 0.,
+                 drop_path: float = 0.1,
                  expansion_ratio: float = 1.0
                  ):
         super(mosr, self).__init__()
         len_blocks = len(blocks)
         dims = [in_ch] + list(dims)
+        dp_rates = [x.item() for x in torch.linspace(0, drop_path, sum(blocks))]
         self.gblocks = nn.Sequential(
-            *[GatedBlocks(dims[i], dims[i + 1], blocks[i], drop_path=drop_path,
+            *[GatedBlocks(dims[i], dims[i + 1], blocks[i], drop_path=dp_rates[sum(blocks[:i]):sum(blocks[:i+1])],
                           expansion_ratio=expansion_ratio
                           )
               for i in range(len_blocks)]
@@ -99,6 +121,7 @@ class mosr(nn.Module):
                           3, padding=1),
                 nn.PixelShuffle(upscale)
             )
+            # trunc_normal_(self.upsampler[0].weight, std=0.02)
         elif upsampler == "dys":
             self.upsampler = DySample(dims[-1], out_ch, upscale)
         elif upsampler == "conv":
@@ -113,14 +136,8 @@ class mosr(nn.Module):
             raise NotImplementedError(
                 f'upsampler: {upsampler} not supported, choose one of these options: \
                 ["ps", "dys", "conv"] conv supports only 1x')
-        self.apply(self._init_weights)
-
-    def _init_weights(self, m):
-        if isinstance(m, (nn.Conv2d, nn.Linear)):
-            trunc_normal_(m.weight, std=.02)
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
 
     def forward(self, x):
         x = self.gblocks(x)
         return self.upsampler(x)
+
