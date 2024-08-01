@@ -1,143 +1,163 @@
 import torch
 from torch import nn
 from torch.nn.init import trunc_normal_
+
 from neosr.archs.arch_util import DropPath, DySample
 from neosr.utils.registry import ARCH_REGISTRY
 
 
-upscale, __ = net_opt()
+class PixelShuffleAct(nn.Module):
+    r"""the same pixelshuffle, but after preliminary convolution, activation is applied"""
 
-
-class DCCM(nn.Sequential):
-    "Doubled Convolutional Channel Mixer"
-
-    def __init__(self, in_ch: int, out_ch):
-        super().__init__(
-            nn.Conv2d(in_ch, out_ch * 2, 3, 1, 1),
-            nn.Mish(),
-            nn.Conv2d(out_ch * 2, out_ch, 3, 1, 1),
+    def __init__(self, dim: int, out_ch: int, upscale: int):
+        super(PixelShuffleAct).__init__()
+        self.ps_act = nn.Sequential(
+            nn.Conv2d(dim, out_ch * (upscale ** 2), 3, 1, 1),
+            nn.LeakyReLU(inplace=True),
+            nn.PixelShuffle(upscale)
         )
-        trunc_normal_(self[-1].weight, std=0.02)
+
+    def forward(self, x):
+        return self.ps_act(x)
+
+
+class LayerNorm(nn.Module):
+
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.bias = nn.Parameter(torch.zeros(dim))
+        self.eps = eps
+
+    def forward(self, x):
+        u = x.mean(1, keepdim=True)
+        s = (x - u).pow(2).mean(1, keepdim=True)
+        x = (x - u) / torch.sqrt(s + self.eps)
+        return self.weight[:, None, None] * x + self.bias[:, None, None]
+
+
+class ConvBlock(nn.Module):
+    r"""https://github.com/joshyZhou/AST/blob/main/model.py#L22"""
+
+    def __init__(self, in_channel: int, out_channel: int, strides: int = 1):
+        super(ConvBlock, self).__init__()
+        self.strides = strides
+        self.in_channel = in_channel
+        self.out_channel = out_channel
+        self.block = nn.Sequential(
+            nn.Conv2d(in_channel, out_channel, kernel_size=3, stride=strides, padding=1),
+            nn.LeakyReLU(inplace=True),
+            nn.Conv2d(out_channel, out_channel, kernel_size=3, stride=strides, padding=1),
+            nn.LeakyReLU(inplace=True),
+        )
+        self.conv11 = nn.Conv2d(in_channel, out_channel, kernel_size=1, stride=strides, padding=0)
+
+    def forward(self, x):
+        out1 = self.block(x)
+        out2 = self.conv11(x)
+        out = out1 + out2
+        return out
 
 
 class GatedCNNBlock(nn.Module):
-    r""" Our implementation of Gated CNN Block: https://arxiv.org/pdf/1612.08083
-    Args:
-        conv_ratio: control the number of channels to conduct depthwise convolution.
-            Conduct convolution on partial channels can improve paraitcal efficiency.
-            The idea of partial channels is from ShuffleNet V2 (https://arxiv.org/abs/1807.11164) and
-            also used by InceptionNeXt (https://arxiv.org/abs/2303.16900) and FasterNet (https://arxiv.org/abs/2303.03667)
+    r"""
+    modernized mambaout main unit
+    https://github.com/yuweihao/MambaOut/blob/main/models/mambaout.py#L119
     """
 
-    def __init__(self, dim,
-                 expansion_ratio=8 / 3,
-                 kernel_size=7,
-                 conv_ratio=1.0,
-                 drop_path=0.):
+    def __init__(self, dim: int,
+                 expansion_ratio: float = 8 / 3,
+                 conv_ratio: float = 1.0,
+                 kernel_size: int = 7,
+                 drop_path: float = 0.):
         super().__init__()
-        self.norm = nn.LayerNorm(dim, eps=1e-6)
+        self.norm = LayerNorm(dim)
         hidden = int(expansion_ratio * dim)
-        self.fc1 = nn.Linear(dim, hidden * 2)
+        self.fc1 = nn.Conv2d(dim, hidden * 2, 3, 1, 1)
+
         self.act = nn.Mish()
         conv_channels = int(conv_ratio * dim)
         self.split_indices = [hidden, hidden - conv_channels, conv_channels]
-        self.conv = nn.Conv2d(conv_channels, conv_channels, kernel_size=kernel_size, padding=kernel_size // 2,
-                              groups=conv_channels)
-        self.fc2 = nn.Linear(hidden, dim)
+
+        self.conv = nn.Conv2d(conv_channels, conv_channels, kernel_size, 1, kernel_size // 2, groups=conv_channels)
+        self.fc2 = nn.Conv2d(hidden, dim, 3, 1, 1)
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.apply(self._init_weights)
 
-    def _init_weights(self, m):
-        if isinstance(m, (nn.Conv2d, nn.Linear)):
+    @staticmethod
+    def _init_weights(m):
+        if isinstance(m, nn.Conv2d | nn.Linear):
             trunc_normal_(m.weight, std=.02)
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
 
     def forward(self, x):
-        shortcut = x  # [B, H, W, C]
+        shortcut = x
         x = self.norm(x)
-        g, i, c = torch.split(self.fc1(x), self.split_indices, dim=-1)
-        c = c.permute(0, 3, 1, 2)  # [B, H, W, C] -> [B, C, H, W]
+        g, i, c = torch.split(self.fc1(x), self.split_indices, dim=1)
         c = self.conv(c)
-        c = c.permute(0, 2, 3, 1)  # [B, C, H, W] -> [B, H, W, C]
-        x = self.fc2(self.act(g) * torch.cat((i, c), dim=-1))
+        x = self.act(self.fc2(self.act(g) * torch.cat((i, c), dim=1)))
         x = self.drop_path(x)
         return x + shortcut
 
 
-class GatedBlocks(nn.Module):
-    def __init__(self,
-                 in_dim,
-                 out_dim,
-                 n_blocks,
-                 drop_path,
-                 expansion_ratio
-                 ):
-        super().__init__()
-        self.in_to_out = nn.Conv2d(in_dim, out_dim, 3, 1, 1)
-        self.dcm_mix = DCCM(out_dim, out_dim)
-        self.gcnn = nn.Sequential(
-            *[GatedCNNBlock(out_dim,
-                            expansion_ratio=expansion_ratio,
-                            drop_path=drop_path[i])
-              for i in range(n_blocks)
-              ])
-
-    def forward(self, x):
-        x = self.in_to_out(x)
-        short_cut = x
-        x = self.gcnn(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
-        x = self.dcm_mix(x)
-        return x + short_cut
-
-
 @ARCH_REGISTRY.register()
 class mosr(nn.Module):
+    """Mamba Out Super-Resolution"""
+
     def __init__(self,
                  in_ch: int = 3,
                  out_ch: int = 3,
-                 upscale: int = upscale,
-                 blocks: list[int] = [3, 3, 15, 3],
-                 dims: list[int] = [64, 96, 192, 288],
-                 upsampler: str = "ps",
-                 drop_path: float = 0.1,
-                 expansion_ratio: float = 1.0
+                 upscale: int = 2,
+                 n_block: int = 24,
+                 dim: int = 64,
+                 upsampler: str = "ps",  # "ps" "ds" "psa"
+                 drop_path: float = 0.0,
+                 kernel_size: int = 7,
+                 expansion_ratio: float = 1.25,
+                 conv_ratio: float = 1.25
                  ):
         super(mosr, self).__init__()
-        len_blocks = len(blocks)
-        dims = [in_ch] + list(dims)
-        dp_rates = [x.item() for x in torch.linspace(0, drop_path, sum(blocks))]
-        self.gblocks = nn.Sequential(
-            *[GatedBlocks(dims[i], dims[i + 1], blocks[i], drop_path=dp_rates[sum(blocks[:i]):sum(blocks[:i+1])],
-                          expansion_ratio=expansion_ratio
-                          )
-              for i in range(len_blocks)]
-        )
+        if upsampler in ["ps", "psa"]:
+            out_ch = in_ch
+        dp_rates = [x.item() for x in torch.linspace(0, drop_path, n_block)]
+        self.gblocks = nn.Sequential(*[nn.Conv2d(in_ch, dim, 3, 1, 1)] +
+                                      [GatedCNNBlock(dim=dim,
+                                                     expansion_ratio=expansion_ratio,
+                                                     kernel_size=kernel_size,
+                                                     conv_ratio=conv_ratio,
+                                                     drop_path=dp_rates[index],
+
+                                                     )
+                                       for index in range(n_block)]
+                                      + [nn.Conv2d(dim, dim * 2, 3, 1, 1),
+                                         nn.Mish(),
+                                         nn.Conv2d(dim * 2, dim, 3, 1, 1),
+                                         nn.Mish(),
+                                         nn.Conv2d(dim, dim, 1, 1)]
+                                     )
+
+        self.shortcut = ConvBlock(in_ch, dim)
 
         if upsampler == "ps":
             self.upsampler = nn.Sequential(
-                nn.Conv2d(dims[-1],
-                          out_ch * (upscale ** 2),
-                          3, padding=1),
+                nn.Conv2d(dim, out_ch * (upscale ** 2), 3, 1, 1),
                 nn.PixelShuffle(upscale)
             )
-            # trunc_normal_(self.upsampler[0].weight, std=0.02)
+        elif upsampler == "psa":
+            self.upsampler = PixelShuffleAct(dim, out_ch, upscale)
         elif upsampler == "dys":
-            self.upsampler = DySample(dims[-1], out_ch, upscale)
-        elif upsampler == "conv":
-            if upsampler != 1:
-                msg = "conv supports only 1x"
-                raise ValueError(msg)
-
-            self.upsampler = nn.Conv2d(dims[-1],
-                                       out_ch,
-                                       3, padding=1)
+            self.upsampler = DySample(dim, out_ch, upscale)
         else:
             raise NotImplementedError(
                 f'upsampler: {upsampler} not supported, choose one of these options: \
                 ["ps", "dys", "conv"] conv supports only 1x')
 
     def forward(self, x):
-        x = self.gblocks(x)
+        x = self.gblocks(x) + self.shortcut(x)
         return self.upsampler(x)
 
+
+@ARCH_REGISTRY.register()
+def mosr_t(**kwargs):
+    return mosr(n_block=4, dim=48, expansion_ratio=1.25, conv_ratio=1.25, **kwargs)

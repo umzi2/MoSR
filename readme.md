@@ -3,45 +3,57 @@ This architecture was inspired by MambaOut
 
 ```py 
 def detect(state):
-    len_blocks = get_seq_len(state, "gblocks")
-    blocks = [get_seq_len(state, f"gblocks.{index}.gcnn")
-              for index in range(len_blocks)
-              ]
-    dims = [state[f"gblocks.{index}.gcnn.0.norm.weight"].shape[0]
-            for index in range(len_blocks)
-            ]
-    state_keys = state.keys()
-    in_ch = state["gblocks.0.in_to_out.weight"].shape[2]
-    expansion = state["gblocks.0.gcnn.0.fc2.weight"].shape
-    expansion_ratio = expansion[1] / expansion[0]
-    if "upsampler.weight" in state_keys:
-        upsampler = "conv"
-        upscale = 1
-        out_ch = state["upsampler.weight"].shape[0]
-    elif "upsampler.0.weight" in state_keys:
-        upsampler = "ps"
-        out_ch = in_ch
-        upscale = int((state["upsampler.0.weight"].shape[0] / out_ch) ** 0.5)
-    else:
+    # Get values from state
+    n_block = get_seq_len(state, "gblocks") - 6
+    in_ch = state["gblocks.0.weight"].shape[1]
+    dim = state["gblocks.0.weight"].shape[0]
+
+    # Calculate expansion ratio and convolution ratio
+    expansion_ratio = (state["gblocks.1.fc1.weight"].shape[0] / 
+                       state["gblocks.1.fc1.weight"].shape[1]) / 2
+    conv_ratio = state["gblocks.1.conv.weight"].shape[0] / dim
+
+    # Determine upsampler type and calculate upscale
+    if "upsampler.init_pos" in state:
         upsampler = "dys"
         out_ch = state["upsampler.end_conv.weight"].shape[0]
-        upscale = int((state["upsampler.offset.weight"].shape[0] / 2 / 4) ** 0.5)
+        upscale = math.isqrt(state["upsampler.offset.weight"].shape[0] // 8)
+    elif "upsampler.ps_act.0.weight" in state:
+        upsampler = "psa"
+        out_ch = in_ch
+        upscale = math.isqrt(state["upsampler.ps_act.0.weight"].shape[0] // out_ch)
+    else:
+        upsampler = "ps"
+        out_ch = in_ch
+        upscale = math.isqrt(state["upsampler.0.weight"].shape[0] // out_ch)
 
-    print(f"""
-in_ch = {in_ch}
-out_ch = {out_ch}
-upscale = {upscale}
-blocks = {blocks}
-dims = {dims}
-upscaler = {upsampler}
-expansion_ratio = {expansion_ratio}
-""")
+    # Print results
+    print(f"""    in_ch: {in_ch}
+    out_ch: {out_ch}
+    dim: {dim}
+    n_block: {n_block}
+    upsampler: {upsampler}
+    upscale: {upscale}
+    expansion_ratio: {expansion_ratio}
+    conv_ratio: {conv_ratio}""")
+
+signature = [
+    'gblocks.0.weight',
+    'gblocks.0.bias',
+    'gblocks.1.norm.weight',
+    'gblocks.1.norm.bias',
+    'gblocks.1.fc1.weight',
+    'gblocks.1.fc1.bias',
+    'gblocks.1.conv.weight',
+    'gblocks.1.conv.bias',
+    'gblocks.1.fc2.weight',
+    'gblocks.1.fc2.bias',
+]
 ```
 ### References:
 Training code from [NeoSR](https://github.com/muslll/neosr)
 
 [MambaOut](https://github.com/yuweihao/MambaOut)
 
-[DyConv](https://github.com/kaijieshi7/Dynamic-convolution-Pytorch)
 ### TODO:
 - release metrics and pretrain
