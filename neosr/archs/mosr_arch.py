@@ -98,14 +98,14 @@ class mosr(nn.Module):
                  upscale: int = upscale,
                  n_block: int = 24,
                  dim: int = 64,
-                 upsampler: str = "ps",  # "ps" "ds" "psa"
+                 upsampler: str = "ps",  # "ps" "ds"
                  drop_path: float = 0.0,
                  kernel_size: int = 7,
                  expansion_ratio: float = 1.5,
                  conv_ratio: float = 1.0
                  ):
         super(mosr, self).__init__()
-        if upsampler in ["ps", "psa"]:
+        if upsampler in ["ps"]:
             out_ch = in_ch
         dp_rates = [x.item() for x in torch.linspace(0, drop_path, n_block)]
         self.gblocks = nn.Sequential(*[nn.Conv2d(in_ch, dim, 3, 1, 1)] +
@@ -134,9 +134,9 @@ class mosr(nn.Module):
         elif upsampler == "dys":
             self.upsampler = DySample(dim, out_ch, upscale)
         else:
-            raise NotImplementedError(
+            raise ValueError(
                 f'upsampler: {upsampler} not supported, choose one of these options: \
-                ["ps", "dys", "conv"] conv supports only 1x')
+                ["ps", "dys"]')
 
     def forward(self, x):
         x = self.gblocks(x) + (self.shortcut(x) - 0.5)
