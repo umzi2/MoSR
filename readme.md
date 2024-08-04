@@ -9,10 +9,9 @@ def detect(state):
     dim = state["gblocks.0.weight"].shape[0]
 
     # Calculate expansion ratio and convolution ratio
-    expansion_ratio = (state["gblocks.1.fc1.weight"].shape[0] / 
-                       state["gblocks.1.fc1.weight"].shape[1]) / 2
+    expansion_ratio = (state["gblocks.1.fc1.weight"].shape[0] / state["gblocks.1.fc1.weight"].shape[1]) / 2
     conv_ratio = state["gblocks.1.conv.weight"].shape[0] / dim
-
+    kernel_size = state["gblocks.1.conv.weight"].shape[2]
     # Determine upsampler type and calculate upscale
     if "upsampler.init_pos" in state:
         upsampler = "dys"
@@ -34,8 +33,10 @@ def detect(state):
     n_block: {n_block}
     upsampler: {upsampler}
     upscale: {upscale}
+    kernel_size: {kernel_size}
     expansion_ratio: {expansion_ratio}
     conv_ratio: {conv_ratio}""")
+
 
 signature = [
     'gblocks.0.weight',
@@ -56,4 +57,4 @@ Training code from [NeoSR](https://github.com/muslll/neosr)
 [MambaOut](https://github.com/yuweihao/MambaOut)
 
 ### TODO:
-- release metrics and pretrain
+- release pretrain
