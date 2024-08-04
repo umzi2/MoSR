@@ -2,23 +2,10 @@ import torch
 from torch import nn
 from torch.nn.init import trunc_normal_
 
-from neosr.archs.arch_util import DropPath, DySample
+from neosr.archs.arch_util import DropPath, DySample, net_opt
 from neosr.utils.registry import ARCH_REGISTRY
 
-
-class PixelShuffleAct(nn.Module):
-    r"""the same pixelshuffle, but after preliminary convolution, activation is applied"""
-
-    def __init__(self, dim: int, out_ch: int, upscale: int):
-        super(PixelShuffleAct).__init__()
-        self.ps_act = nn.Sequential(
-            nn.Conv2d(dim, out_ch * (upscale ** 2), 3, 1, 1),
-            nn.LeakyReLU(inplace=True),
-            nn.PixelShuffle(upscale)
-        )
-
-    def forward(self, x):
-        return self.ps_act(x)
+upscale, __ = net_opt()
 
 
 class LayerNorm(nn.Module):
@@ -46,9 +33,9 @@ class ConvBlock(nn.Module):
         self.out_channel = out_channel
         self.block = nn.Sequential(
             nn.Conv2d(in_channel, out_channel, kernel_size=3, stride=strides, padding=1),
-            nn.LeakyReLU(inplace=True),
+            nn.Mish(),
             nn.Conv2d(out_channel, out_channel, kernel_size=3, stride=strides, padding=1),
-            nn.LeakyReLU(inplace=True),
+            nn.Mish(),
         )
         self.conv11 = nn.Conv2d(in_channel, out_channel, kernel_size=1, stride=strides, padding=0)
 
@@ -69,7 +56,7 @@ class GatedCNNBlock(nn.Module):
                  expansion_ratio: float = 8 / 3,
                  conv_ratio: float = 1.0,
                  kernel_size: int = 7,
-                 drop_path: float = 0.):
+                 drop_path: float = 0.5):
         super().__init__()
         self.norm = LayerNorm(dim)
         hidden = int(expansion_ratio * dim)
@@ -81,7 +68,7 @@ class GatedCNNBlock(nn.Module):
 
         self.conv = nn.Conv2d(conv_channels, conv_channels, kernel_size, 1, kernel_size // 2, groups=conv_channels)
         self.fc2 = nn.Conv2d(hidden, dim, 3, 1, 1)
-        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.drop_path = DropPath(drop_path) if drop_path > 0. or not self.training else nn.Identity()
         self.apply(self._init_weights)
 
     @staticmethod
@@ -98,7 +85,7 @@ class GatedCNNBlock(nn.Module):
         c = self.conv(c)
         x = self.act(self.fc2(self.act(g) * torch.cat((i, c), dim=1)))
         x = self.drop_path(x)
-        return x + shortcut
+        return x + (shortcut - 0.5)
 
 
 @ARCH_REGISTRY.register()
@@ -108,14 +95,14 @@ class mosr(nn.Module):
     def __init__(self,
                  in_ch: int = 3,
                  out_ch: int = 3,
-                 upscale: int = 2,
+                 upscale: int = upscale,
                  n_block: int = 24,
                  dim: int = 64,
                  upsampler: str = "ps",  # "ps" "ds" "psa"
                  drop_path: float = 0.0,
                  kernel_size: int = 7,
-                 expansion_ratio: float = 1.25,
-                 conv_ratio: float = 1.25
+                 expansion_ratio: float = 1.5,
+                 conv_ratio: float = 1.0
                  ):
         super(mosr, self).__init__()
         if upsampler in ["ps", "psa"]:
@@ -129,12 +116,12 @@ class mosr(nn.Module):
                                                      drop_path=dp_rates[index],
 
                                                      )
-                                       for index in range(n_block)]
-                                      + [nn.Conv2d(dim, dim * 2, 3, 1, 1),
-                                         nn.Mish(),
-                                         nn.Conv2d(dim * 2, dim, 3, 1, 1),
-                                         nn.Mish(),
-                                         nn.Conv2d(dim, dim, 1, 1)]
+                                       for index in range(n_block)] +
+                                      [nn.Conv2d(dim, dim * 2, 3, 1, 1),
+                                       nn.Mish(),
+                                       nn.Conv2d(dim * 2, dim, 3, 1, 1),
+                                       nn.Mish(),
+                                       nn.Conv2d(dim, dim, 1, 1)]
                                      )
 
         self.shortcut = ConvBlock(in_ch, dim)
@@ -144,8 +131,6 @@ class mosr(nn.Module):
                 nn.Conv2d(dim, out_ch * (upscale ** 2), 3, 1, 1),
                 nn.PixelShuffle(upscale)
             )
-        elif upsampler == "psa":
-            self.upsampler = PixelShuffleAct(dim, out_ch, upscale)
         elif upsampler == "dys":
             self.upsampler = DySample(dim, out_ch, upscale)
         else:
@@ -154,10 +139,10 @@ class mosr(nn.Module):
                 ["ps", "dys", "conv"] conv supports only 1x')
 
     def forward(self, x):
-        x = self.gblocks(x) + self.shortcut(x)
+        x = self.gblocks(x) + (self.shortcut(x) - 0.5)
         return self.upsampler(x)
 
 
 @ARCH_REGISTRY.register()
 def mosr_t(**kwargs):
-    return mosr(n_block=4, dim=48, expansion_ratio=1.25, conv_ratio=1.25, **kwargs)
+    return mosr(n_block=5, dim=48, expansion_ratio=1.5, conv_ratio=1.00, **kwargs)
