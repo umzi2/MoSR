@@ -8,6 +8,31 @@ from neosr.utils.registry import ARCH_REGISTRY
 upscale, __ = net_opt()
 
 
+class GPS(nn.Module):
+    """Geo ensemble PielShuffle"""
+
+    def __init__(
+            self, dim,
+            scale,
+            out_ch=3,
+            # Own parameters
+            kernel_size: int = 3
+    ):
+        super().__init__()
+        self.in_to_k = nn.Conv2d(dim, scale * scale * out_ch * 8, kernel_size, 1, kernel_size // 2)
+        self.ps = nn.PixelShuffle(scale)
+
+    def forward(self, x):
+        rgb = self._geo_ensemble(x)
+        rgb = self.ps(rgb)
+        return rgb
+
+    def _geo_ensemble(self, x):
+        x = self.in_to_k(x)
+        x = x.reshape(x.shape[0], 8, -1, x.shape[-2], x.shape[-1])
+        x = x.mean(dim=1)
+        return x
+
 class LayerNorm(nn.Module):
 
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -105,7 +130,7 @@ class mosr(nn.Module):
                  conv_ratio: float = 1.0
                  ):
         super(mosr, self).__init__()
-        if upsampler in ["ps"]:
+        if upsampler in ["ps", "gps"]:
             out_ch = in_ch
         dp_rates = [x.item() for x in torch.linspace(0, drop_path, n_block)]
         self.gblocks = nn.Sequential(*[nn.Conv2d(in_ch, dim, 3, 1, 1)] +
@@ -131,12 +156,14 @@ class mosr(nn.Module):
                 nn.Conv2d(dim, out_ch * (upscale ** 2), 3, 1, 1),
                 nn.PixelShuffle(upscale)
             )
+        elif upsampler == "gps":
+            self.upsampler = GPS(dim, upscale, out_ch)
         elif upsampler == "dys":
             self.upsampler = DySample(dim, out_ch, upscale)
         else:
             raise ValueError(
                 f'upsampler: {upsampler} not supported, choose one of these options: \
-                ["ps", "dys"]')
+                ["ps", "gps", "dys"]')
 
     def forward(self, x):
         x = self.gblocks(x) + (self.shortcut(x) - 0.5)
