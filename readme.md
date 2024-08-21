@@ -17,10 +17,10 @@ def detect(state):
         upsampler = "dys"
         out_ch = state["upsampler.end_conv.weight"].shape[0]
         upscale = math.isqrt(state["upsampler.offset.weight"].shape[0] // 8)
-    elif "upsampler.ps_act.0.weight" in state:
-        upsampler = "psa"
+    elif "upsampler.in_to_k.weight" in state:
+        upsampler = 'gps'
         out_ch = in_ch
-        upscale = math.isqrt(state["upsampler.ps_act.0.weight"].shape[0] // out_ch)
+        upscale = math.isqrt(state['upsampler.in_to_k.weight'].shape[0] // 8 // out_ch)
     else:
         upsampler = "ps"
         out_ch = in_ch
